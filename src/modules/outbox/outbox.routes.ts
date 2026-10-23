@@ -1,16 +1,24 @@
+import crypto from 'crypto';
 import { FastifyInstance, FastifyPluginAsync } from 'fastify';
 import { outboxService } from './outbox.service';
 import { env } from '../../config/env';
 import { ForbiddenError, UnauthorizedError } from '../../utils/errors';
 
 export const outboxRoutes: FastifyPluginAsync = async (fastify: FastifyInstance) => {
-  // Admin authentication hook for outbox management
+  // Admin authentication hook for outbox management with constant-time comparison
   fastify.addHook('preHandler', async (request) => {
     const adminKey = request.headers['x-admin-key'];
-    if (!adminKey) {
+    if (!adminKey || typeof adminKey !== 'string') {
       throw new UnauthorizedError('Missing required X-Admin-Key header');
     }
-    if (adminKey !== env.ADMIN_API_KEY) {
+
+    const expectedBuffer = Buffer.from(env.ADMIN_API_KEY);
+    const providedBuffer = Buffer.from(adminKey);
+
+    if (
+      expectedBuffer.length !== providedBuffer.length ||
+      !crypto.timingSafeEqual(expectedBuffer, providedBuffer)
+    ) {
       throw new ForbiddenError('Invalid administrative API key');
     }
   });

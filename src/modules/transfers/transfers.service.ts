@@ -90,12 +90,12 @@ export class TransfersService {
 
     try {
       return await withTransaction(async (client) => {
-        // 1. Check if idempotency key already exists
+        // 1. Check if idempotency key already exists for this user
         const existingRes = await client.query<TransferRecord>(
           `SELECT id, user_id, status, request_hash, response_payload
            FROM transfers
-           WHERE idempotency_key = $1`,
-          [idempotencyKey]
+           WHERE user_id = $1 AND idempotency_key = $2`,
+          [userId, idempotencyKey]
         );
 
         if (existingRes.rowCount && existingRes.rowCount > 0) {
@@ -164,16 +164,20 @@ export class TransfersService {
         let exchangeRate = 1.0;
         let destinationAmount = input.amount;
 
-        // 5. Insert transfer record
+        // Fee Engine: Charge 1.5% fee on cross-currency transfers, 0% on same-currency
+        const feeAmount = isCrossCurrency ? Math.max(1, Math.round(input.amount * 0.015)) : 0;
+        const netSourceAmount = input.amount - feeAmount;
+
+        // 5. Currency conversion (FX) on net amount
         if (isCrossCurrency) {
-          const fx = await fxService.convert(input.amount, fromAccount.currency, toAccount.currency);
+          const fx = await fxService.convert(netSourceAmount, fromAccount.currency, toAccount.currency);
           exchangeRate = fx.rate;
           destinationAmount = fx.destinationAmount;
         }
 
         const transferInsertRes = await client.query<{ id: string; created_at: Date }>(
-          `INSERT INTO transfers (user_id, from_account, to_account, amount, destination_amount, exchange_rate, status, idempotency_key, request_hash)
-           VALUES ($1, $2, $3, $4, $5, $6, 'COMPLETED', $7, $8)
+          `INSERT INTO transfers (user_id, from_account, to_account, amount, destination_amount, exchange_rate, fee_amount, status, idempotency_key, request_hash)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'COMPLETED', $8, $9)
            RETURNING id, created_at`,
           [
             userId,
@@ -182,6 +186,7 @@ export class TransfersService {
             input.amount,
             destinationAmount,
             exchangeRate,
+            feeAmount,
             idempotencyKey,
             requestHash,
           ]
@@ -214,23 +219,38 @@ export class TransfersService {
           newFromBalance = parseInt(updatedFrom.rows[0].balance, 10);
           newToBalance = parseInt(updatedTo.rows[0].balance, 10);
         } else {
-          // --- CROSS-CURRENCY TRUE DOUBLE-ENTRY VIA SYSTEM_FX_CLEARING (4 entries) ---
-          // Currency 1 Leg (USD): Sender Debit (-amount), Source Clearing Credit (+amount) -> Σ = 0
-          // Currency 2 Leg (EUR): Target Clearing Debit (-destinationAmount), Recipient Credit (+destinationAmount) -> Σ = 0
+          // --- CROSS-CURRENCY TRUE DOUBLE-ENTRY VIA SYSTEM_FX_CLEARING & SYSTEM_FEES_REVENUE (6 entries) ---
+          // Currency 1 Leg (Source Currency):
+          // 1. Sender Debit full amount (-amount)
+          // 2. Source Clearing Credit net amount (+netSourceAmount)
+          // 3. Fee Revenue Credit fee (+feeAmount)
+          // Sum in source currency: -amount + netSourceAmount + feeAmount = 0
+          //
+          // Currency 2 Leg (Target Currency):
+          // 4. Target Clearing Debit (-destinationAmount)
+          // 5. Recipient Credit (+destinationAmount)
+          // Sum in target currency: -destinationAmount + destinationAmount = 0
           const sourceClearing = await this.getSystemAccount(client, 'SYSTEM_FX_CLEARING', fromAccount.currency);
           const targetClearing = await this.getSystemAccount(client, 'SYSTEM_FX_CLEARING', toAccount.currency);
+          const feeRevenue = await this.getSystemAccount(client, 'SYSTEM_FEES_REVENUE', fromAccount.currency);
 
-          // Leg 1 Entries
+          // Leg 1 Entries (Source Currency: Σ = 0)
           await client.query(
             `INSERT INTO ledger_entries (transfer_id, account_id, amount) VALUES ($1, $2, $3)`,
             [transfer.id, input.fromAccountId, -input.amount]
           );
           await client.query(
             `INSERT INTO ledger_entries (transfer_id, account_id, amount) VALUES ($1, $2, $3)`,
-            [transfer.id, sourceClearing.id, input.amount]
+            [transfer.id, sourceClearing.id, netSourceAmount]
           );
+          if (feeAmount > 0) {
+            await client.query(
+              `INSERT INTO ledger_entries (transfer_id, account_id, amount) VALUES ($1, $2, $3)`,
+              [transfer.id, feeRevenue.id, feeAmount]
+            );
+          }
 
-          // Leg 2 Entries
+          // Leg 2 Entries (Destination Currency: Σ = 0)
           await client.query(
             `INSERT INTO ledger_entries (transfer_id, account_id, amount) VALUES ($1, $2, $3)`,
             [transfer.id, targetClearing.id, -destinationAmount]
@@ -240,15 +260,21 @@ export class TransfersService {
             [transfer.id, input.toAccountId, destinationAmount]
           );
 
-          // Update balances for all 4 accounts
+          // Update balances for all accounts
           const updatedFrom = await client.query<{ balance: string }>(
             `UPDATE accounts SET balance = balance - $1 WHERE id = $2 RETURNING balance`,
             [input.amount, input.fromAccountId]
           );
           await client.query(
             `UPDATE accounts SET balance = balance + $1 WHERE id = $2`,
-            [input.amount, sourceClearing.id]
+            [netSourceAmount, sourceClearing.id]
           );
+          if (feeAmount > 0) {
+            await client.query(
+              `UPDATE accounts SET balance = balance + $1 WHERE id = $2`,
+              [feeAmount, feeRevenue.id]
+            );
+          }
           await client.query(
             `UPDATE accounts SET balance = balance - $1 WHERE id = $2`,
             [destinationAmount, targetClearing.id]
@@ -271,6 +297,8 @@ export class TransfersService {
             amount: input.amount,
             sourceAmount: input.amount,
             sourceCurrency: fromAccount.currency,
+            feeAmount,
+            netSourceAmount,
             destinationAmount,
             destinationCurrency: toAccount.currency,
             exchangeRate,
@@ -328,12 +356,13 @@ export class TransfersService {
         err.code === '23505' &&
         (err.constraint?.includes('idempotency') || err.detail?.includes('idempotency_key'))
       ) {
-        // Concurrent race condition: wait for winner's commit
-        for (let attempt = 0; attempt < 15; attempt++) {
+        // Postgres aborted the losing transaction on 23505; withTransaction has rolled back.
+        // We now safely query pool in a fresh read transaction to fetch the winner's committed response.
+        for (let attempt = 0; attempt < 20; attempt++) {
           await new Promise((r) => setTimeout(r, 40));
           const res = await pool.query<TransferRecord>(
-            `SELECT request_hash, response_payload FROM transfers WHERE idempotency_key = $1`,
-            [idempotencyKey]
+            `SELECT request_hash, response_payload FROM transfers WHERE user_id = $1 AND idempotency_key = $2`,
+            [userId, idempotencyKey]
           );
           if (res.rowCount && res.rowCount > 0 && res.rows[0].response_payload) {
             if (res.rows[0].request_hash && res.rows[0].request_hash !== requestHash) {

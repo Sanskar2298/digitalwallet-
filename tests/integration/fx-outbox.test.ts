@@ -30,7 +30,9 @@ describe('Multi-Currency FX, Chart of Accounts & Outbox Tests', () => {
     await depositToAccount(app, userA.token, aliceUsdAccount.id, 10000);
 
     // Transfer $50.00 (5000 cents) USD to Bob EUR wallet
-    // At FX rate 0.92, 5000 * 0.92 = 4600 EUR cents (€46.00)
+    // Fee: 1.5% of 5000 = 75 cents USD
+    // Net converted amount: 5000 - 75 = 4925 USD cents
+    // At FX rate 0.92: 4925 * 0.92 = 4531 EUR cents (€45.31)
     const transferRes = await app.inject({
       method: 'POST',
       url: '/transfers',
@@ -48,26 +50,28 @@ describe('Multi-Currency FX, Chart of Accounts & Outbox Tests', () => {
     expect(transferRes.statusCode).toBe(200);
     const body = JSON.parse(transferRes.body);
     expect(body.transfer.sourceAmount).toBe(5000);
+    expect(body.transfer.feeAmount).toBe(75);
+    expect(body.transfer.netSourceAmount).toBe(4925);
     expect(body.transfer.sourceCurrency).toBe('USD');
-    expect(body.transfer.destinationAmount).toBe(4600);
+    expect(body.transfer.destinationAmount).toBe(4531);
     expect(body.transfer.destinationCurrency).toBe('EUR');
     expect(body.transfer.exchangeRate).toBe(0.92);
 
     // Alice balance after: 10000 - 5000 = 5000 USD cents
     expect(body.fromAccountBalance).toBe(5000);
-    // Bob balance after: 0 + 4600 = 4600 EUR cents
-    expect(body.toAccountBalance).toBe(4600);
+    // Bob balance after: 0 + 4531 = 4531 EUR cents
+    expect(body.toAccountBalance).toBe(4531);
 
     // Verify database balances
     const aliceDb = await testPool.query('SELECT balance, currency FROM accounts WHERE id = $1', [aliceUsdAccount.id]);
     expect(parseInt(aliceDb.rows[0].balance, 10)).toBe(5000);
 
     const bobDb = await testPool.query('SELECT balance, currency FROM accounts WHERE id = $1', [bobEurAccount.id]);
-    expect(parseInt(bobDb.rows[0].balance, 10)).toBe(4600);
+    expect(parseInt(bobDb.rows[0].balance, 10)).toBe(4531);
 
-    // Verify true 4-entry double-entry ledger:
-    // USD entries sum to 0 (-5000 + 5000)
-    // EUR entries sum to 0 (-4600 + 4600)
+    // Verify true balanced double-entry ledger:
+    // USD entries: Alice (-5000), Clearing (+4925), Fee Revenue (+75) -> Sum = 0
+    // EUR entries: Clearing (-4531), Bob (+4531) -> Sum = 0
     const ledger = await testPool.query<{ amount: string; currency: string }>(
       `SELECT le.amount, a.currency 
        FROM ledger_entries le 
@@ -75,7 +79,7 @@ describe('Multi-Currency FX, Chart of Accounts & Outbox Tests', () => {
        WHERE le.transfer_id = $1`,
       [body.transfer.id]
     );
-    expect(ledger.rowCount).toBe(4);
+    expect(ledger.rowCount).toBe(5);
 
     const usdSum = ledger.rows
       .filter((r) => r.currency === 'USD')
@@ -99,8 +103,9 @@ describe('Multi-Currency FX, Chart of Accounts & Outbox Tests', () => {
     await depositToAccount(app, userA.token, aliceUsd.id, 5000);
 
     // Transfer $50.00 to JPY.
+    // Fee: 1.5% of 5000 = 75 cents. Net = 4925 cents.
     // USD has 2 decimals, JPY has 0 decimals.
-    // Rate = 150.0. Calculation: 5000 * 150 * 10^(0 - 2) = 7500 JPY (¥7,500)
+    // Rate = 150.0. Calculation: 4925 * 150 * 10^(0 - 2) = 7388 JPY (¥7,388)
     const transferRes = await app.inject({
       method: 'POST',
       url: '/transfers',
@@ -117,10 +122,10 @@ describe('Multi-Currency FX, Chart of Accounts & Outbox Tests', () => {
 
     expect(transferRes.statusCode).toBe(200);
     const body = JSON.parse(transferRes.body);
-    expect(body.transfer.destinationAmount).toBe(7500); // ¥7,500, NOT 750,000!
+    expect(body.transfer.destinationAmount).toBe(7388); // ¥7,388
 
     const bobDb = await testPool.query('SELECT balance FROM accounts WHERE id = $1', [bobJpy.id]);
-    expect(parseInt(bobDb.rows[0].balance, 10)).toBe(7500);
+    expect(parseInt(bobDb.rows[0].balance, 10)).toBe(7388);
   });
 
   it('Rejects idempotency key reuse with mismatched request payload (Stripe 422 behavior)', async () => {

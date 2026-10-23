@@ -197,11 +197,7 @@ flowchart LR
 
 **Security & Architecture:**
 - **Automated Background Poller:** Runs continuously inside the process (configurable via `OUTBOX_POLL_INTERVAL_MS`), using `FOR UPDATE SKIP LOCKED` for concurrent cluster safety.
-- **Admin Authentication:** The HTTP event audit endpoints (`GET /outbox/events` and `POST /outbox/process`) are locked behind `X-Admin-Key` verification to protect sensitive financial payloads.
-
----
-
-## Database Schema (9 Migrations)
+- **Admin Authentication:** The HTTP event audit endpoints (`GET /outbox/events` and `POST /outbox/process`) are locked behind `X-Admin-Key` verification to protect sensitive financial payloa## Database Schema (10 Migrations)
 
 | # | Migration | Description |
 |---|---|---|
@@ -211,9 +207,10 @@ flowchart LR
 | 004 | `create_ledger_entries` | Insert-only ledger entries with transfer + account FKs |
 | 005 | `prevent_ledger_tampering` | PostgreSQL trigger blocking `UPDATE`/`DELETE` on ledger |
 | 006 | `chart_of_accounts` | `account_type` enum, pre-provisioned system accounts |
-| 007 | `exchange_rates` | FX rates table, `destination_amount`/`exchange_rate` columns, 8 seeded pairs |
+| 007 | `exchange_rates` | Configurable FX rates table, `destination_amount`/`exchange_rate` columns, 8 seeded pairs |
 | 008 | `outbox_events` | Outbox table with status tracking, retry count, indexed on `(status, created_at)` |
 | 009 | `harden_transfers_and_system_accounts` | Added `user_id`, `request_hash`, `fee_amount`, plus JPY & GBP system accounts |
+| 010 | `system_account_constraint_and_scoped_idempotency` | Exempted system clearing accounts from non-negative balance checks; scoped idempotency to `(user_id, idempotency_key)` |
 
 ---
 
@@ -226,10 +223,10 @@ flowchart LR
 | `POST` | `/accounts` | Create a new wallet account | Yes |
 | `GET` | `/accounts/:id` | Fetch account balance and info | Yes (Owner) |
 | `POST` | `/accounts/:id/deposit` | Atomically deposit funds | Yes (Owner) |
-| `POST` | `/transfers` | Transfer money with double-entry ledger | Yes (Owner, Rate-limited) |
+| `POST` | `/transfers` | Transfer money with double-entry ledger & fee engine | Yes (Owner, Rate-limited) |
 | `POST` | `/transfers/:id/reverse` | Reverse a completed transfer | Yes (Original Sender / Admin) |
 | `GET` | `/accounts/:id/transactions` | Cursor-paginated ledger entries with date/type filters | Yes (Owner) |
-| `GET` | `/fx/rates` | List all available FX exchange rates | No |
+| `GET` | `/fx/rates` | List configurable FX exchange rates | No |
 | `GET` | `/outbox/events` | Query outbox audit log (sensitive payloads) | **Admin** (`X-Admin-Key`) |
 | `POST` | `/outbox/process` | Trigger manual processing of pending outbox events | **Admin** (`X-Admin-Key`) |
 | `GET` | `/health` | Health check for API and PostgreSQL | No |
@@ -237,52 +234,22 @@ flowchart LR
 
 ---
 
-## Stripe-Style Idempotency Engine
+## Stripe-Style Idempotency Engine & Race Safety
 
 The idempotency layer handles real-world distributed edge cases:
-1. **Request Fingerprinting (SHA-256):** Every transfer computes `SHA256(userId + fromAccountId + toAccountId + amount)`.
-2. **Payload Mismatch Protection (HTTP 422):** If a client retries with an identical `Idempotency-Key` but alters the payload (e.g. changing amount from $10 to $500), the request is rejected with `422 Unprocessable Entity`.
-3. **Database Race Handling (23505 Unique Violation):** If two identical requests race past the initial check concurrently, Postgres blocks one at the database unique index. The losing transaction catches error `23505`, waits for the winner's commit, and returns the committed response without a 500.
+1. **User-Scoped Idempotency:** The uniqueness index is scoped to `UNIQUE(user_id, idempotency_key)`. Two distinct users can safely use identical client keys without collisions.
+2. **Request Fingerprinting (SHA-256):** Every transfer computes `SHA256(userId + fromAccountId + toAccountId + amount)`.
+3. **Payload Mismatch Protection (HTTP 422):** If a client retries with an identical `Idempotency-Key` but alters the payload (e.g. changing amount from $10 to $500), the request is rejected with `422 Unprocessable Entity`.
+4. **PostgreSQL 23505 Unique Violation & Transaction Abort Safety:** When two concurrent requests with identical keys pass the initial check simultaneously, one hits Postgres error `23505 (unique_violation)`. PostgreSQL aborts that transaction immediately. The engine catches `23505`, **rolls back the aborted transaction**, and in a fresh read transaction polls the committed winning record to return the response cleanly without raising an unhandled 500.
 
 ---
 
-## Design Decisions & Trade-Offs
+## Clearing Accounts & System Inventory Rebalancing
 
-### 1. Raw `pg` vs ORM (Prisma / TypeORM)
-* **Decision**: Raw `pg` for all transaction-critical code.
-* **Rationale**: Financial systems require explicit control over `SELECT ... FOR UPDATE`, transaction isolation levels, deterministic lock ordering, and connection checkout. ORMs introduce uncontrolled implicit queries and non-deterministic join locking.
-
-### 2. Monetary Precision: `BIGINT` Minor Units (Cents)
-* **Decision**: All balances and amounts stored as 64-bit integer cents with `CHECK (balance >= 0)` and `CHECK (amount > 0)`.
-* **Rationale**: Floating-point suffers from binary rounding (`0.1 + 0.2 ≠ 0.3`). Integer cents provide exact arithmetic and payment gateway compatibility (Stripe, Adyen).
-
-### 3. Deadlock Prevention via Deterministic Lock Ordering
-* **Decision**: Both accounts locked using `SELECT ... FOR UPDATE ... ORDER BY id ASC`.
-* **Rationale**: Bi-directional transfers ($A → B$ and $B → A$) concurrently would create cyclic waits. Deterministic ordering by UUID guarantees an invariant locking hierarchy.
-
-### 4. Database-Enforced Ledger Immutability
-* **Decision**: PostgreSQL trigger `trg_prevent_ledger_update_delete` raises an exception on any `UPDATE` or `DELETE`.
-* **Rationale**: No software bug or rogue query can tamper with the financial audit trail. Reversals create new offsetting entries.
-
-### 5. Cached Balances with Reconciliation Proof
-* **Decision**: Balances cached on `accounts.balance` instead of computing `SUM(ledger_entries.amount)` per request.
-* **Rationale**: On-the-fly summing is $O(N)$ over millions of rows. Cached balance provides $O(1)$ reads. Correctness proven by the reconciliation job.
-
-### 6. Idempotency Response Caching (In-DB, No Redis)
-* **Decision**: `UNIQUE` constraint on `idempotency_key` with `response_payload JSONB` stored on the transfer.
-* **Rationale**: Network retries receive the exact original response without duplicating money. No external cache dependency required.
-
-### 7. Cursor-Based Pagination
-* **Decision**: Composite `(created_at, id)` cursor instead of `OFFSET/LIMIT`.
-* **Rationale**: `OFFSET` degrades to $O(N)$ on deep pages and misses/duplicates rows on concurrent inserts. Cursors use indexed lookups.
-
-### 8. Transactional Outbox (No Dual-Write Risk)
-* **Decision**: Outbox events inserted in the **same** database transaction as the financial mutation.
-* **Rationale**: Avoids the dual-write problem where a transfer commits but the event publish fails (or vice versa). The outbox worker can safely retry from `PENDING` events.
-
-### 9. FX Rate Lookup with Inverse Fallback
-* **Decision**: If no direct rate exists for `USD→GBP`, the system checks `GBP→USD` and computes the inverse.
-* **Rationale**: Halves the number of required rate entries. Rates are stored with `NUMERIC(18,6)` precision.
+- **Balance Constraint Exemption:** Customer accounts enforce `CHECK (balance >= 0)`. Migration `010` relaxes this constraint for `account_type != 'CUSTOMER_WALLET'`, allowing `SYSTEM_FX_CLEARING` accounts to hold negative balances representing the platform's net FX inventory short/long position.
+- **Inventory Replenishment & Spread Engine:** In production, clearing accounts do not replenish automatically. The 1.5% cross-currency fee engine credited to `SYSTEM_FEES_REVENUE` covers currency volatility and conversion costs. In an institutional setup, a treasury rebalancing engine periodically executes wholesale FX settlement batches between platform bank cash reserves and clearing accounts.
+- **At-Least-Once Outbox Delivery:** The transactional outbox guarantees that every emitted event will be published at least once. Downstream event consumers (webhooks, Kafka consumers) must implement idempotent processing using the unique `eventId` or `aggregateId`.
+- **Constant-Time Security:** Internal outbox administrative endpoints use `crypto.timingSafeEqual` to prevent timing side-channel attacks on `X-Admin-Key`.
 
 ---
 
@@ -308,7 +275,7 @@ docker compose up -d postgres
 ```bash
 npm run migrate
 ```
-This will create both `digital_wallet` and `digital_wallet_test` databases and apply all 8 migrations.
+This will create both `digital_wallet` and `digital_wallet_test` databases and apply all 10 migrations.
 
 ### 4. Start the Application
 ```bash
@@ -336,12 +303,12 @@ npm test
 
 | Test Suite | What It Proves |
 |---|---|
-| `auth.test.ts` | Registration, login, JWT token generation, duplicate email rejection |
-| `accounts.test.ts` | Account creation, balance queries, deposits with double-entry |
-| `transfers.test.ts` | Atomic transfers, authorization checks, insufficient funds, reversals |
-| `idempotency.test.ts` | Duplicate transfers return cached response without double-spending |
-| `fx-outbox.test.ts` | Cross-currency FX conversion (USD→EUR at 0.92), outbox event emission & dispatch, Chart of Accounts types |
-| `parallel-transfers.test.ts` | 100 concurrent bi-directional transfers: zero deadlocks, exact balance invariance, $\Sigma\text{ledger} = 0$ |
+| `auth.test.ts` | Registration, login, JWT token generation, duplicate email rejection (409), input validation (400) |
+| `accounts.test.ts` | Account creation, balance queries, deposits with double-entry, owner authorization (403), cursor pagination |
+| `transfers.test.ts` | Atomic transfers, authorization checks, insufficient funds rollback (422), sender reversal with offsetting entries |
+| `idempotency.test.ts` | 10 concurrent requests with same key produce exactly 1 transfer, return matching payload, debit only once |
+| `fx-outbox.test.ts` | 5-entry double-entry with fee engine, JPY 0-decimal scale conversion, Stripe 422 mismatch rejection, constant-time `X-Admin-Key` verification (400/403/200), outbox dispatch |
+| `parallel-transfers.test.ts` | 100 concurrent bi-directional transfers: zero deadlocks (`ORDER BY id ASC`), exact balance invariance, $\Sigma\text{ledger} = 0$ |
 
 ---
 
@@ -370,14 +337,55 @@ k6 run load-tests/k6-transfers.js
 
 ```
 digital-wallet/
-├── migrations/                    # Sequential SQL migrations (001-008)
+├── migrations/                    # Sequential SQL migrations (001-010)
 │   ├── 001_create_users.sql
 │   ├── 002_create_accounts.sql
 │   ├── 003_create_transfers.sql
 │   ├── 004_create_ledger_entries.sql
 │   ├── 005_prevent_ledger_tampering.sql
 │   ├── 006_chart_of_accounts.sql       # Account types & system accounts
-│   ├── 007_exchange_rates.sql          # FX rates table & seeded pairs
+│   ├── 007_exchange_rates.sql          # Configurable FX rates table & seeded pairs
+│   ├── 008_outbox_events.sql           # Transactional outbox table
+│   ├── 009_harden_transfers_and_system_accounts.sql  # User IDs, fee_amount, request_hash
+│   └── 010_system_account_constraint_and_scoped_idempotency.sql # Clearing constraint & user-scoped index
+├── src/
+│   ├── config/
+│   │   ├── database.ts                 # pg Pool, withTransaction helper
+│   │   └── env.ts                      # Zod-validated environment config
+│   ├── modules/
+│   │   ├── auth/                       # Register, Login, JWT
+│   │   ├── accounts/                   # CRUD, Deposits with double-entry
+│   │   ├── transfers/                  # Atomic transfers, FX clearing, fee engine, reversals
+│   │   ├── ledger/                     # Cursor-paginated transaction queries
+│   │   ├── fx/                         # FX rate lookup & currency conversion (ISO 4217 exponents)
+│   │   └── outbox/                     # Event emission & background poller worker
+│   ├── plugins/
+│   │   ├── auth.plugin.ts              # JWT verification hook
+│   │   ├── error-handler.ts            # Centralized error handler
+│   │   ├── rate-limit.plugin.ts        # Per-endpoint rate limiting
+│   │   └── swagger.plugin.ts           # OpenAPI / Swagger UI
+│   ├── utils/
+│   │   ├── errors.ts                   # Custom error classes
+│   │   └── logger.ts                   # Pino structured logger
+│   ├── app.ts                          # Fastify app builder
+│   └── server.ts                       # Entry point with graceful shutdown & background poller
+├── scripts/
+│   ├── migrate.ts                      # Migration runner
+│   ├── setup-db.ts                     # DB creation + migration
+│   ├── reconcile.ts                    # Per-currency double-entry ledger audit
+│   └── demo.ts                         # Live end-to-end demo
+├── tests/
+│   ├── helpers/test-db.ts              # Test setup, fixtures, cleanup
+│   ├── integration/                    # Auth, accounts, transfers, FX, outbox tests
+│   └── concurrency/                    # 100-parallel-transfer test
+├── load-tests/
+│   └── k6-transfers.js                 # k6 load testing script
+├── docker-compose.yml                  # PostgreSQL 16 container
+├── Dockerfile                          # Multi-stage production build (non-root, health check)
+├── package.json
+├── tsconfig.json
+└── jest.config.ts
+```e & seeded pairs
 │   └── 008_outbox_events.sql           # Transactional outbox table
 ├── src/
 │   ├── config/

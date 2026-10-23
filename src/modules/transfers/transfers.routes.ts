@@ -48,6 +48,8 @@ export const transfersRoutes: FastifyPluginAsync = async (fastify: FastifyInstan
                   amount: { type: 'number' },
                   sourceAmount: { type: 'number' },
                   sourceCurrency: { type: 'string' },
+                  feeAmount: { type: 'number' },
+                  netSourceAmount: { type: 'number' },
                   destinationAmount: { type: 'number' },
                   destinationCurrency: { type: 'string' },
                   exchangeRate: { type: 'number' },

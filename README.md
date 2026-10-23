@@ -394,6 +394,31 @@ npm run test:coverage # Generate coverage report
 k6 run load-tests/k6-transfers.js
 ```
 
+#### Benchmark Results (50 VUs, 30s ramp)
+
+| Metric | Value |
+|---|---|
+| **Completed Transfers** | 1,572 |
+| **Requests/sec (avg)** | 61.8 |
+| **p50 Latency** | 463 ms |
+| **p95 Latency** | 723 ms |
+| **HTTP Failure Rate** | 0.00% |
+| **Transfer Success Rate** | 100% |
+
+**Post-run invariant check** (`npm run reconcile`):
+
+```
+Currency  Net Ledger Sum  Status
+USD       0               ✅ BALANCED
+EUR       0               ✅ BALANCED
+GBP       0               ✅ BALANCED
+JPY       0               ✅ BALANCED
+──────────────────────────────────────
+Result: RECONCILED — zero invariant violations
+```
+
+> Hardware: Docker Desktop (WSL2), PostgreSQL 16, Node 22. Results will vary by environment.
+
 ---
 
 ## Project Structure

@@ -12,7 +12,9 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
-COPY migrations ./migrations
+COPY --from=builder /app/scripts ./scripts
+COPY --from=builder /app/migrations ./migrations
+RUN chmod +x ./scripts/start.sh
 
 USER node
 
@@ -20,4 +22,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
 
-CMD ["node", "dist/server.js"]
+CMD ["./scripts/start.sh"]

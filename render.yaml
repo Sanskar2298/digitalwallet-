@@ -9,23 +9,23 @@ services:
     name: digital-wallet-api
     runtime: docker
     plan: free
-        dockerfilePath: ./Dockerfile
-        startCommand: ./scripts/start.sh
-        envVars:
-          - key: DATABASE_URL
-            fromDatabase:
-              name: digital-wallet-db
-              property: connectionString
-          - key: JWT_SECRET
-            generateValue: true
-          - key: ADMIN_API_KEY
-            generateValue: true
-          - key: NODE_ENV
-            value: production
-          - key: HOST
-            value: 0.0.0.0
-          - key: PORT
-            value: 3000
-          - key: ENABLE_OUTBOX_WORKER
-            value: "true"
-        healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    startCommand: ./scripts/start.sh
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: digital-wallet-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 3000
+      - key: ENABLE_OUTBOX_WORKER
+        value: "true"
+    healthCheckPath: /health

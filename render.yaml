@@ -10,7 +10,6 @@ services:
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
-    startCommand: ./scripts/start.sh
     envVars:
       - key: DATABASE_URL
         fromDatabase:
